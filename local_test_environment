@@ -1,0 +1,698 @@
+import pandas as pd
+from datetime import datetime
+import logging
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Connection
+from typing import Tuple, List, Optional
+import calendar
+from datetime import timedelta, datetime
+from sqlalchemy import create_engine, exc
+import numpy as np
+
+# Path to CSV file
+
+def input_data_quality(df: pd.DataFrame, csv_file_path: str) -> bool:
+    """
+    Validates the data quality of the input DataFrame. The required columns change based on
+    whether the file contains "nTOU".
+ 
+    :param df: DataFrame to validate
+    :param file_name: Name of the file to determine the required columns
+    :return: True if data passes all checks, False otherwise
+    """
+    if "nTOU" in csv_file_path:
+        curve_type = "nTOU" # nTOU curve            
+    else:    
+        curve_type = "TOU" # TOU curve  
+   
+    # Check if the file name contains "nTOU" to determine required columns
+    if "nTOU" in curve_type:
+        required_columns = [
+            'Date', 'WKM', 'BEN', 'NI_daily_charge', 'SI_daily_charge',
+            'NI_profile_factor', 'SI_profile_factor', 'Version', 'Created_By'
+        ]
+    else:
+        required_columns = [
+            'Date', 'WKM', 'BEN', 'Version', 'Created_By'
+        ]
+   
+    # Check if all required columns exist
+    if not all(column in df.columns for column in required_columns):
+        logging.error(f"Missing one or more required columns: {required_columns}")
+        return False
+ 
+    # Check Date format (MM/DD/YYYY)
+    try:
+        df['Date'] = pd.to_datetime(df['Date'], format='%m/%d/%Y')
+    except ValueError:
+        logging.error("Date column has incorrect format. Expected MM/DD/YYYY.")
+        return False
+   
+    # Check if WKM and BEN are numeric
+    if not pd.to_numeric(df['WKM'], errors='coerce').notnull().all():
+        logging.error("WKM column contains non-numeric values.")
+        return False
+   
+    if not pd.to_numeric(df['BEN'], errors='coerce').notnull().all():
+        logging.error("BEN column contains non-numeric values.")
+        return False
+ 
+    # If "nTOU" is in the file, validate additional columns
+    if "nTOU" in curve_type:
+        # Check if NI_daily_charge and SI_daily_charge are numeric non-negative
+        if not pd.to_numeric(df['NI_daily_charge'], errors='coerce').notnull().all() or (df['NI_daily_charge'] < 0).any():
+            logging.error("NI_daily_charge column contains invalid values (should be numeric and non-negative).")
+            return False
+       
+        if not pd.to_numeric(df['SI_daily_charge'], errors='coerce').notnull().all() or (df['SI_daily_charge'] < 0).any():
+            logging.error("SI_daily_charge column contains invalid values (should be numeric and non-negative).")
+            return False
+ 
+        # Check if NI_profile_factor and SI_profile_factor are between 0 and 100
+        if not ((df['NI_profile_factor'] >= 0) & (df['NI_profile_factor'] <= 100)).all():
+            logging.error("NI_profile_factor column contains values outside the range [0, 1].")
+            return False
+       
+        if not ((df['SI_profile_factor'] >= 0) & (df['SI_profile_factor'] <= 100)).all():
+            logging.error("SI_profile_factor column contains values outside the range [0, 1].")
+            return False
+ 
+    # Check if Version is consistent (all the same) and non-negative
+    if df['Version'].nunique() != 1 or (df['Version'] < 0).any():
+        logging.error("Version column contains inconsistent values.")
+        return False
+   
+    # Check if Created_By is non-empty text
+    if df['Created_By'].isnull().any() or df['Created_By'].str.strip().eq('').any():
+        logging.error("Created_By column contains empty or invalid values.")
+        return False
+   
+    logging.info("Data validation passed successfully.")
+    return curve_type
+
+def cast_input_dataframe(df: pd.DataFrame, curve_type: str) -> pd.DataFrame: ## Needs to be changed----------------------------------
+    """
+    Function to cast the DataFrame columns based on the type of input (nTOU or TOU).
+   
+    Parameters:
+    df (pd.DataFrame): Input DataFrame with raw data
+    is_nTOU (bool): Boolean flag to determine whether the DataFrame corresponds to nTOU (True) or TOU (False)
+   
+    Returns:
+    pd.DataFrame: DataFrame with properly casted types and relevant columns
+    """
+   
+    # Cast the 'Date' column to datetime
+    df['Date'] = df.Date.astype(str)
+    df['Date'] = pd.to_datetime(df['Date'],format = '%Y-%d-%m')
+ 
+    # Cast 'Version' column to integer (to avoid scientific notation)
+    df['Version'] = df['Version'].astype('int64')
+ 
+    # Cast relevant columns to float
+    df['WKM'] = df['WKM'].astype(float)
+    df['BEN'] = df['BEN'].astype(float)
+ 
+    # Handle additional columns based on nTOU or TOU
+    if "nTOU" in curve_type:
+        # These columns only exist in nTOU files
+        df['NI_daily_charge'] = df['NI_daily_charge'].astype(float)
+        df['SI_daily_charge'] = df['SI_daily_charge'].astype(float)
+        df['NI_profile_factor'] = df['NI_profile_factor'].astype(float)
+        df['SI_profile_factor'] = df['SI_profile_factor'].astype(float)
+   
+    # Display the dtypes to verify
+    logging.info(f"Input file Data types after casting: \n{df.dtypes}")
+   
+    return df
+
+def get_input_price(df: pd.DataFrame, curve_type: str) -> pd.DataFrame:
+    # Setup the DataFrame and adjust index
+    df_input_price = df.copy()
+    df_input_price.set_index('Date', inplace=True)
+    df_input_price.index.name = None
+    #df_input_price.index = pd.to_datetime(df_input_price.index, format='%d/%m/%Y')
+    df_input_price.drop(['Version','Created_By'],axis = 1,inplace = True)
+    # Stack the data and adjust column names
+    df_input_price = df_input_price.stack().to_frame().reset_index()
+    df_input_price.columns = ['NZDTMonth', 'BasisNode', 'InputPrice']
+    
+    # Sort by NZDTMonth
+    df_input_price.sort_values(by='NZDTMonth', inplace=True)        
+    return df_input_price
+
+
+def get_sql_conn_tid() -> Connection:
+    """
+    Establishes a connection to the SQL Server using SQLAlchemy.
+    
+    Returns:
+    Connection: An SQLAlchemy connection object.
+    """
+    try:
+        # Define the connection string
+        connection_str = (
+            'mssql+pyodbc://AZURE-WA-LCOM-QA-READ:M3nzUJzRhtaz8LDPxVo2gk4Lq@10.232.0.60:1433/tid?driver=ODBC+Driver+17+for+SQL+Server&TrustServerCertificate=yes'
+        )
+        
+        # Create a SQLAlchemy engine
+        engine = create_engine(connection_str)
+        
+        # Connect to the SQL Server
+        connection = engine.connect()
+        
+        logging.info("Successfully established connection to SQL Server.")
+        
+        return connection
+
+    except Exception as e:
+        logging.error(f"Error while connecting to SQL Server: {e}")
+        raise  # Reraise the exception to handle it upstream
+
+def get_ssp_area_from_tid(connection: Connection) -> pd.DataFrame:
+    """
+    Retrieves SSP Area data from the TID database using an existing SQLAlchemy connection.
+
+    Parameters:
+    connection (Connection): An existing SQLAlchemy connection object.
+
+    Returns:
+    pd.DataFrame: A DataFrame containing the result of the query.
+    """
+    ssp_code_value = '???'
+    query_sspareas = f"""
+    SELECT DISTINCT    
+        [SSPArea].SSPCode as SSPAreaCode,
+        [Node].Island
+    FROM 
+        [TID].[dbo].[Node] AS [Node]
+    LEFT JOIN 
+        [TID].[dbo].[SSPArea] AS [SSPArea]
+    ON 
+        [Node].[NodeCode] = [SSPArea].[Buscode]
+    WHERE 
+        [SSPArea].SSPCode IS NOT NULL AND
+        [SSPArea].[SSPCode] != '{ssp_code_value}' AND
+        [Node].[Island] IS NOT NULL;
+    """
+    try:
+        # Execute the query using the provided connection
+        df = pd.read_sql(query_sspareas, connection)
+        df = df.sort_values(by=['SSPAreaCode', 'Island'])
+        # Define the mapping for replacement
+        mapping = {'N': 'NI', 'S': 'SI'}    
+        # Apply the mapping to the 'Island' column
+        df['Island'] = df['Island'].map(mapping)
+        logging.info("Successfully fetched SSP Area data from TID.")
+        return df
+
+    except Exception as e:
+        logging.error(f"Error while executing the query to retrieve SSP Areas: {e}")
+        return pd.DataFrame()  # Return an empty DataFrame in case of error
+
+def get_dls(connection: Connection, start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+    """
+    Retrieve Daylight Saving Time (DLS) data from TID for a given date range.
+
+    This function queries a SQL database for NZDT (New Zealand Daylight Time) and NZST (New Zealand Standard Time)
+    records within a specified date range. It then processes this information, determining UTC offset,
+    creating additional time-related columns, and classifying each date as a weekday or other day type.
+
+    Args:
+        connection (Connection): An SQLAlchemy Connection instance that provides a connection to the database.
+        start_date (pd.Timestamp): A pandas Timestamp representing the start of the date range for the query.
+        end_date (pd.Timestamp): A pandas Timestamp representing the end of the date range for the query.
+
+    Returns:
+        pd.DataFrame: A pandas DataFrame with columns corresponding to the processed datetime information, including:
+        - 'UTC': The UTC offset for each date.
+        - 'NZDT': The original NZDTDateTime values from the database.
+        - 'NZDTMonth': The first day of the month for each 'NZDT' value.
+        - 'DateFrom': The start date in 'YYYYMMDD' format.
+        - 'TimeFrom': The start time in 'HHMMSS' format.
+        - 'DateTo': The end date in 'YYYYMMDD' format, adjusted by 30 minutes from 'NZDT'.
+        - 'TimeTo': The end time in 'HHMMSS' format, adjusted by 30 minutes from 'NZDT'.
+        - 'DayType': A string indicating if the date is a weekday ('WD') or other day ('OD').
+        - 'SSPPeriod': The period of the day, calculated as the hour divided by four, plus one.
+
+    Notes:
+        - The function assumes that the SQL table '[TID].[dbo].[Calendar]' contains the columns
+          'NZDTDateTime' and 'NZSTDateTime'.
+        - The date range for the SQL query is extended to the start of the year of the start_date and
+          to the start of the year following the end_date to include all potential DLS shifts.
+    """
+    # Adjust date range to cover potential DLS shifts
+    start = datetime(start_date.year, 1, 1)
+    end = datetime(end_date.year + 1, 1, 1)
+
+    # SQL query to fetch the data
+    sql = f"""
+    SELECT
+        [NZDTDateTime],
+        [NZSTDateTime]
+    FROM [TID].[dbo].[Calendar]
+    WHERE NZDTDateTime BETWEEN '{start}' AND '{end}'
+    """
+       
+    try:
+        # Execute the SQL query and load data into a DataFrame
+        df_datetime = pd.read_sql(sql, connection)      
+    except Exception as e:
+        logging.error(f"Error while executing the query to retrieve the calendar from TID: {e}")
+        return pd.DataFrame()  # Return an empty DataFrame in case of error
+
+        # Rename columns for clarity
+    df_datetime = df_datetime.rename(columns={'NZSTDateTime': 'NZST', 'NZDTDateTime': 'NZDT'})
+
+    # Determine the UTC offset based on whether 'NZSTDateTime' and 'NZDTDateTime' are equal
+    df_datetime['NZST'] = pd.to_datetime(df_datetime['NZST'],format='%Y-%m-%d %H:%M:%S')
+    df_datetime['NZDT'] = pd.to_datetime(df_datetime['NZDT'],format='%Y-%m-%d %H:%M:%S')
+    
+    df_datetime['UTCTo'] = np.where(df_datetime['NZST'] == df_datetime['NZDT'], '12', '13')
+    df_datetime['UTCTo'] = df_datetime['UTCTo'].astype(int)
+    df_datetime['UTCFrom'] = np.where(df_datetime['NZST'] == df_datetime['NZDT'], '12', '13')
+    df_datetime['UTCFrom'] = df_datetime['UTCFrom'].astype(int)
+    
+    # Filter data to match the provided date range
+    df_datetime = df_datetime[(df_datetime['NZDT'] >= start_date) & (df_datetime['NZDT'] <= end_date)]
+
+    # Sort values by 'NZST' and 'UTCFrom'
+    df_datetime = df_datetime.sort_values(by=['NZST', 'UTCFrom']).reset_index(drop=True)
+
+    # Create additional columns for the DataFrame
+    df_datetime['NZDTMonth'] = df_datetime['NZDT'].apply(lambda x: x.replace(day=1))
+    df_datetime['NZDTMonth'] = df_datetime.NZDTMonth.astype(str)
+    df_datetime['NZDTMonth'] = pd.to_datetime(df_datetime['NZDTMonth'],format='%Y-%m-%d %H:%M:%S').dt.strftime("%Y-%m-%d")
+    df_datetime['NZDTMonth'] = pd.to_datetime(df_datetime['NZDTMonth'],format='%Y-%m-%d')
+    df_datetime['DateFrom'] = df_datetime['NZDT'].dt.strftime('%Y%m%d')
+    df_datetime['TimeFrom'] = df_datetime['NZDT'].dt.strftime('%H%M%S')
+    df_datetime['DateTo'] = (df_datetime['NZDT'] + timedelta(minutes=30)).dt.strftime('%Y%m%d')
+    df_datetime['TimeTo'] = (df_datetime['NZDT'] + timedelta(minutes=30)).dt.strftime('%H%M%S')
+    df_datetime['DayType'] = df_datetime['NZDT'].apply(lambda x: 'WD' if x.weekday() < 5 else 'OD')
+    # SSPPeriod to calculate the intra-day profiles
+    df_datetime['SSPPeriod'] = (df_datetime['NZDT'].dt.hour // 4 + 1).astype(float) 
+
+    logging.info("Successfully fetched calendar data from TID.")
+    
+    return df_datetime
+
+def get_ssparea_list(connection: Connection) -> pd.DataFrame:
+    """
+    Retrieves SSP Area data from the TID database using an existing SQLAlchemy connection.
+ 
+    Parameters:
+    connection (Connection): An existing SQLAlchemy connection object.
+ 
+    Returns:
+    pd.DataFrame: A DataFrame containing the result of the query.
+    """
+    ssp_code_value = '???'
+    query_sspareas = f"""
+    SELECT DISTINCT    
+        [SSPArea].SSPCode as SSPAreaCode,
+        [Node].Island
+    FROM
+        [TID].[dbo].[Node] AS [Node]
+    LEFT JOIN
+        [TID].[dbo].[SSPArea] AS [SSPArea]
+    ON
+        [Node].[NodeCode] = [SSPArea].[Buscode]
+    WHERE
+        [SSPArea].SSPCode IS NOT NULL AND
+        [SSPArea].[SSPCode] != '{ssp_code_value}' AND
+        [Node].[Island] IS NOT NULL;
+    """
+    try:
+        # Execute the query using the provided connection 
+        df = pd.read_sql(query_sspareas, connection)
+        df = df.sort_values(by=['SSPAreaCode', 'Island'])
+        # Define the mapping for replacement
+        mapping = {'N': 'NI', 'S': 'SI'}    
+        # Apply the mapping to the 'Island' column
+        df['Island'] = df['Island'].map(mapping)
+        ssp_list_ni = df[df.Island == 'NI'].SSPAreaCode.to_list()
+        ssp_list_si = df[df.Island == 'SI'].SSPAreaCode.to_list()
+        logging.info("Successfully fetched SSP Area data from TID.")
+        return ssp_list_ni, ssp_list_si 
+    except Exception as e:
+        logging.error(f"Error while executing the query to retrieve the SSP Areas from TID: {e}")
+        return pd.DataFrame()  # Return an empty DataFrame in case of error
+
+def get_latest_ssp_prices(
+        connection: Connection, start_date: pd.Timestamp, end_date: pd.Timestamp, ssp_list_ni: List[str], ssp_list_si: List[str],
+        price_curve_type: str) -> pd.DataFrame:
+    """
+    Retrieve the latest SSP prices from TID for a given date range.    
+
+    Args:
+        connection (Connection): A database connection object to execute the SQL query.
+        start_date (pd.Timestamp): The start date of the period to retrieve SSP prices for.
+        end_date (pd.Timestamp): The end date of the period to retrieve SSP prices for.
+        ssp_list_ni (List[str]): A list of SSPAreaCodes to be considered as 'WKM'.
+        ssp_list_si (List[str]): A list of SSPAreaCodes to be considered as 'BEN'.
+
+    Returns:
+        pd.DataFrame: A DataFrame containing the latest SSP prices if all area codes are valid.
+                      Returns an empty DataFrame and logs an error if any area code is not in the provided lists.
+    """
+    
+    sql = f"""
+    SELECT NZDTMonth, SSPAreaCode, SSPPeriod, DayType, DayNight, Version, SSPPrice
+    FROM (
+        SELECT *,
+            ROW_NUMBER() OVER (
+                PARTITION BY NZDTMonth, SSPAreaCode, SSPPeriod, DayType, DayNight
+                ORDER BY Version DESC
+            ) as rn
+        FROM [TID].[dbo].[SSPPrice]
+        WHERE NZDTMonth BETWEEN '{start_date.strftime('%Y-%m-%d')}' AND '{end_date.strftime('%Y-%m-%d')}'
+    ) as ranked_versions
+    WHERE rn = 1
+    """
+    try:
+        df_ssp_price_latest = pd.read_sql(sql, connection)
+    except Exception as e:
+        logging.error(f"Error while executing the query to retrieve the SSP Prices from TID: {e}")
+        return pd.DataFrame()  # Return an empty DataFrame in case of error
+   
+    # Combine both lists to validate the SSPAreaCodes
+    combined_ssp_list = set(ssp_list_ni) | set(ssp_list_si)
+   
+    # Check for SSPAreaCodes not in either provided list
+    invalid_area_codes = df_ssp_price_latest.loc[~df_ssp_price_latest['SSPAreaCode'].isin(combined_ssp_list), 'SSPAreaCode'].unique()
+    if len(invalid_area_codes) > 0:
+        logging.error(f"Invalid SSPAreaCodes found: {invalid_area_codes}. Function will return an empty DataFrame.")
+        return pd.DataFrame()  # Return an empty DataFrame if any invalid codes are found
+       
+    #Add a column to categorize the SSPAreaCode as 'WKM' or 'BEN' based on the provided list
+    df_ssp_price_latest['BasisNode'] = df_ssp_price_latest['SSPAreaCode'].apply(lambda x: 'WKM' if x in ssp_list_ni else 'BEN')
+    # Sort the DataFrame
+    df_ssp_price_latest = df_ssp_price_latest.sort_values(by=['NZDTMonth','SSPAreaCode', 'SSPPeriod'])
+   
+    if price_curve_type == 'nTOU':
+       
+        df_ssp_price_latest_ntou = df_ssp_price_latest.copy()
+       
+    # Calculate the average SSPPrice per NZDTMonth and SSPAreaCode
+        df_ssp_price_latest_ntou_avg = df_ssp_price_latest_ntou.groupby(['NZDTMonth', 'SSPAreaCode'], as_index=False)['SSPPrice'].mean()
+        df_ssp_price_latest_ntou_avg.rename(columns={'SSPPrice': 'AvgSSPPrice'}, inplace=True)
+       
+    # this merge adds the AvgSSPPrice column to the df_ssp_price_latest DataFrame so
+    # that the SSPPrice can replace the Average SSPPrice to remove the profiles
+        df_ssp_price_latest = df_ssp_price_latest.merge(df_ssp_price_latest_ntou_avg, on=['NZDTMonth', 'SSPAreaCode'], how='left')
+    # drops the SSPPrice column with the original profiles
+        df_ssp_price_latest.drop(columns=['SSPPrice'], inplace=True)
+    # renames the AvgSSPPrice column to SSPPrice
+        df_ssp_price_latest.rename(columns={'AvgSSPPrice': 'SSPPrice'}, inplace=True)
+   
+    return df_ssp_price_latest
+
+def calculate_ssp_area_avg(df_ssp_price_latest: pd.DataFrame, df_datetime: pd.DataFrame) -> pd.DataFrame:
+    df_ssp_price_avg = df_ssp_price_latest.copy()
+    df_ssp_price_avg = df_ssp_price_avg[df_ssp_price_avg['SSPAreaCode'].isin(['WKM', 'BEN'])]
+    # this merge makes sure that there is a SSPPrice per NZDTMonth per DayType
+    df_ssp_price_avg = df_datetime.merge(df_ssp_price_avg, on=['NZDTMonth', 'DayType', 'SSPPeriod'], how='inner')
+    # get the mean SSPPrice per BasisNode per NZDTMonth
+    df_ssp_price_avg = df_ssp_price_avg.groupby(['BasisNode', 'NZDTMonth'])['SSPPrice'].mean().to_frame().reset_index()
+        # sort the DataFrame
+    df_ssp_price_avg = df_ssp_price_avg.sort_values(by=['BasisNode', 'NZDTMonth'])
+    return df_ssp_price_avg
+
+def calculate_new_prices(
+    df_input_price: pd.DataFrame,
+    df_ssp_price_avg: pd.DataFrame,
+    df_ssp_price_latest: pd.DataFrame,
+    price_curve_type: str  # New input parameter to determine the input type
+) -> pd.DataFrame:
+    ####### Energy Prices Calculation ########
+    if price_curve_type == 'nTOU':
+        df_profile_factor = df_input_price[df_input_price['BasisNode'].isin(['NI_profile_factor', 'SI_profile_factor'])].copy()
+        # Map NI_Daily_Charge -> WKM, SI_Daily_Charge -> BEN for the merge
+        df_profile_factor['BasisNode'] = df_profile_factor['BasisNode'].replace({
+            'NI_profile_factor': 'WKM',
+            'SI_profile_factor': 'BEN'
+        })
+       
+        # Filter only the NI_Daily_Charge and NI_Daily_Charge rows
+        df_daily_charge = df_input_price[df_input_price['BasisNode'].isin(['NI_daily_charge', 'SI_daily_charge'])].copy()
+ 
+        # Map NI_Daily_Charge -> WKM, SI_Daily_Charge -> BEN for the merge
+        df_daily_charge['BasisNode'] = df_daily_charge['BasisNode'].replace({
+            'NI_daily_charge': 'WKM',
+            'SI_daily_charge': 'BEN'})
+    else:
+       
+        # Create a DataFrame with the 'ProfileFactor' column filled with 1 for TOU curve
+        # This is to enable in the future to have this feature available for TOU curve as well
+        df_profile_factor = pd.DataFrame({
+        'NZDTMonth': df_input_price['NZDTMonth'],  # Copying the 'NZDTMonth' column to retain length
+        'BasisNode': df_input_price['BasisNode'],  # Copying the 'BasisNode' column to retain length
+        'InputPrice': [1] * len(df_input_price),  # Adding a 'ProfileFactor' column filled with 1
+        })
+       
+        df_daily_charge = pd.DataFrame({
+        'NZDTMonth': df_input_price['NZDTMonth'],  # Copying the 'NZDTMonth' column to retain length
+        'BasisNode': df_input_price['BasisNode'],  # Copying the 'BasisNode' column to retain length
+        'InputPrice': [0] * len(df_input_price)  # Adding a 'DailyCharge' column filled with 0
+        })
+       
+ 
+    # Merge the input price the SSP Monthly Averages, latest SSP prices, daily chages and profile factors
+    df_monthly_prices_isl = df_input_price.merge(df_ssp_price_avg, on=['BasisNode', 'NZDTMonth'], how='inner')
+    df_monthly_prices_isl = df_monthly_prices_isl.merge(df_profile_factor, on=['BasisNode', 'NZDTMonth'], how='inner', suffixes=['', 'ProfileFactor'])        
+    df_monthly_prices_isl = df_monthly_prices_isl.merge(df_daily_charge, on=['BasisNode', 'NZDTMonth'], how='inner', suffixes=['', 'DailyCharge'])    
+    df_calculated_prices = df_ssp_price_latest.merge( df_monthly_prices_isl, on=['BasisNode', 'NZDTMonth'], how='inner', suffixes=['', 'Isl'])
+   
+    ####### Energy Price Calculation ########
+    # Energy Price = Input Price * LF * PF = InputPrice * (SSPPrice / SSPPriceIsl) * InputPriceProfileFactor
+    # The division by 1000 is to convert the price from $/MWh to $/kWh
+    df_calculated_prices['EnergyCharge'] = (df_calculated_prices['InputPrice'] * (
+        df_calculated_prices['SSPPrice'] / df_calculated_prices['SSPPriceIsl']) * df_calculated_prices['InputPriceProfileFactor']) / 1000
+    df_calculated_prices['EnergyCharge'] = df_calculated_prices['EnergyCharge'].round(4)
+ 
+    ####### Daily Charge Calculation ########
+    # Daily Charge = Input Daily Charge * LF = InputPriceDailyCharge * (SSPPrice / SSPPriceIsl) *
+    df_calculated_prices['DailyCharge'] = df_calculated_prices['InputPriceDailyCharge'] * (
+        df_calculated_prices['SSPPrice'] / df_calculated_prices['SSPPriceIsl'])
+    df_calculated_prices['DailyCharge'] = df_calculated_prices['DailyCharge'].round(4)
+    return df_calculated_prices
+
+def apply_dls_to_new_prices(df_datetime: pd.DataFrame, df_calculated_prices: pd.DataFrame, price_curve_type: str) -> pd.DataFrame:
+    if price_curve_type == 'nTOU':
+        # list of for the columns to be used in the groupby
+        features_for_groupby = ['NZDTMonth','DayType','SSPPeriod'] # In the future change this to include more profiles i.e. Day/Night WD/OD
+
+    else:
+        
+        features_for_groupby = ['NZDTMonth', 'DayType', 'SSPPeriod']
+    
+
+    # Merge the calculated prices with the datetime DataFrame
+    df_price_with_dls = df_datetime.merge(df_calculated_prices, on=features_for_groupby, how='inner')
+    
+    # there are 2 'UTC' because this is the required field for the downstream team
+    features_for_sap = ['SSPAreaCode', 'DateFrom', 'TimeFrom', 'UTCFrom', 'DateTo', 'TimeTo', 'UTCTo', 'EnergyCharge', 'DailyCharge']
+    df_price_with_dls = df_price_with_dls[features_for_sap]
+            
+    return df_price_with_dls
+
+def validate_dataframe_robotron(df: pd.DataFrame) -> bool:
+    """
+    Validate the DataFrame based on the specified conditions.
+
+    :param df: The DataFrame to validate
+    :return: True if all checks pass, False otherwise
+    """
+    # Check if all required columns are present
+    required_columns = ['SSPAreaCode', 'DateFrom', 'TimeFrom', 'UTCFrom', 'DateTo', 'TimeTo', 'UTCTo', 'EnergyCharge', 'DailyCharge']
+    for col in required_columns:
+        if col not in df.columns:
+            logging.error(f"Validation Error: Missing column '{col}'.")
+            return False
+
+    # Check 'SSPAreaCode': must be three-letter text
+    if not df['SSPAreaCode'].astype(str).str.match(r'^[A-Za-z]{3}$').all():
+        logging.error("Validation Error: 'SSPAreaCode' must be three letters.")
+        return False
+    
+    # Check 'DateFrom' and 'DateTo': must be valid dates
+    try:
+        df['DateFrom'] = pd.to_datetime(df['DateFrom'])
+        df['DateTo'] = pd.to_datetime(df['DateTo'])
+    except ValueError:
+        logging.error("Validation Error: 'DateFrom' or 'DateTo' is not a valid date.")
+        return False
+    
+    # # Check 'TimeFrom' and 'TimeTo': integers between 0 and 2400
+    # if not df['TimeFrom'].between(0, 2400).all():
+    #     logging.error("Validation Error: 'TimeFrom' must be an integer between 0 and 2400.")
+    #     return False
+    # if not df['TimeTo'].between(0, 2400).all():
+    #     logging.error("Validation Error: 'TimeTo' must be an integer between 0 and 2400.")
+    #     return False
+    
+    # Check 'UTCFrom' and 'UTCTo': must be either 12 or 13
+    if not df['UTCFrom'].isin([12, 13]).all():
+        logging.error("Validation Error: 'UTCFrom' must be either 12 or 13.")
+        return False
+    if not df['UTCTo'].isin([12, 13]).all():
+        logging.error("Validation Error: 'UTCTo' must be either 12 or 13.")
+        return False
+    
+    # # Check 'EnergyCharge' and 'DailyCharge': must be floats
+    # if not pd.api.types.is_float_dtype(df['EnergyCharge']):
+    #     logging.error("Validation Error: 'EnergyCharge' must be a float.")
+    #     return False
+    # if not pd.api.types.is_float_dtype(df['DailyCharge']):
+    #     logging.error("Validation Error: 'DailyCharge' must be a float.")
+    #     return False
+    
+    # If all checks pass
+    logging.info("Data validation passed.")
+    return True
+
+def transform_dataframe_robotron(df: pd.DataFrame, created_by) -> pd.DataFrame:
+    """
+    Apply transformations and reorder columns in the DataFrame.
+    
+    :param df: The DataFrame to transform
+    :return: Transformed DataFrame
+    """
+    # Ensure the DataFrame is validated before applying transformations
+    if not validate_dataframe_robotron(df):
+        raise ValueError("DataFrame validation failed. Please validate the DataFrame before transforming.")
+
+    # Sort the rows based on 'SSPAreaCode', 'DateFrom', 'TimeFrom', and 'UTCFrom'
+    df = df.sort_values(by=['SSPAreaCode', 'DateFrom', 'UTCFrom', 'TimeFrom'])    
+    
+    # Apply transformations
+    df['ForecastCode'] = 'ROC'
+    df['CodeType'] = '02'
+    df['Partition'] = 'P001'
+    df['PriceType'] = 'F'
+    df['Unit'] = 'KWH'
+    
+    df['DateFrom'] = df['DateFrom'].dt.strftime('%Y%m%d').astype(int)  # Transform DateFrom to integer
+    df['DateTo'] = df['DateTo'].dt.strftime('%Y%m%d').astype(int)  # Transform DateTo to integer
+    
+    df['UTCFrom'] = '+' + df['UTCFrom'].astype(str)
+    df['UTCTo'] = '+' + df['UTCTo'].astype(str)
+    
+    df['TimeFrom'] = df['TimeFrom'].astype(str).str.zfill(6)
+    df['TimeTo'] = df['TimeTo'].astype(str).str.zfill(6)
+    
+    # 'Created_by', and 'Version' columns 
+    df['Created_by'] = 'AC'  # Assuming empty string as placeholder
+    df['Version'] = datetime.now().strftime('%Y%m%d%H%M')
+    
+    # Define new column order
+    new_column_order = ['SSPAreaCode', 'ForecastCode', 'CodeType', 'Partition', 
+                        'DateFrom', 'TimeFrom', 'UTCFrom',
+                        'DateTo', 'TimeTo', 'UTCTo',
+                        'EnergyCharge', 'PriceType', 'Unit','DailyCharge', 'Created_by', 'Version']
+    
+    # Check for missing columns before reordering
+    missing_cols = set(new_column_order) - set(df.columns)
+    if missing_cols:
+        logging.error(f"Missing columns in DataFrame: {missing_cols}")
+        raise ValueError(f"Missing columns in DataFrame: {missing_cols}")
+    
+    # Reorder columns
+    df = df[new_column_order]
+    
+    logging.info("Data transformation and reordering for Robotron file completed successfully.")
+    return df
+
+
+#############Main####################
+csv_file_path = 'lcom_price_curve_input_20240918115857_nTOU.csv'
+
+if "nTOU" in csv_file_path:
+    curve_type = "nTOU" # nTOU curve            
+else:    
+    curve_type = "TOU" # TOU curve          
+
+# Reading the CSV file into a DataFrame
+df = pd.read_csv(csv_file_path)
+
+# Quality check for input file 
+if input_data_quality(df, curve_type):
+    logging.info("Data in the input file is valid.")
+else:
+    logging.info("Data validation for the input file failed.")
+
+# Cast the input DataFrame
+df = cast_input_dataframe(df, curve_type)
+
+#Get the version value
+version_input_file = df['Version'].iloc[0]
+
+#Get the Created_By value
+created_by_input_file = df['Created_By'].iloc[0]
+
+# Calculate the minimum and maximum dates
+start_date = df['Date'].min()
+end_date = df['Date'].max()
+
+# Get the TID connection engine
+tid_conn = get_sql_conn_tid()
+
+# Get the SSP Area data from TID
+df_ssp_areas = get_ssp_area_from_tid(tid_conn)
+df_ssp_areas.to_csv('1.df_ssp_areas.csv', index=False)
+
+df_input_price = get_input_price(df, curve_type)
+df_input_price.to_csv('2.df_input_price.csv', index=False)
+
+df_calendar = get_dls(tid_conn, start_date, end_date)
+df_calendar.to_csv('3.df_calendar.csv', index=False)
+
+ssp_list_ni, ssp_list_si = get_ssparea_list(tid_conn)
+
+df_ssp_price_latest = get_latest_ssp_prices(tid_conn, start_date, end_date, ssp_list_ni, ssp_list_si, curve_type)
+df_ssp_price_latest.to_csv('4.df_ssp_price_latest.csv', index=False)
+
+df_ssp_price_monthly_avg = calculate_ssp_area_avg(df_ssp_price_latest, df_calendar)
+df_ssp_price_monthly_avg.to_csv('5.df_ssp_price_monthly_avg.csv', index=False)
+
+df_price_model = calculate_new_prices(df_input_price, df_ssp_price_monthly_avg, df_ssp_price_latest, curve_type)
+df_price_model.to_csv('6.df_price_model.csv', index=False)
+
+df_price_with_dls = apply_dls_to_new_prices(df_calendar, df_price_model, curve_type)
+df_price_with_dls.to_csv('7.df_price_with_dls.csv', index=False)
+
+df_outbound = transform_dataframe_robotron(df_price_with_dls, created_by_input_file)
+df_outbound.to_csv('8.df_outbound.csv', index=False)
+
+
+print('input file')
+print(df.head())
+
+print('input price')
+print(df_input_price.head())
+
+print('start date and end date')
+print(start_date)
+print(end_date)
+
+print('ssp calendar')
+print(df_calendar.head())
+
+print('ni and si list')
+print(ssp_list_ni)
+print(ssp_list_si)
+
+print('ssp price latest')
+print(df_ssp_price_latest.head())
+
+print(df_ssp_price_monthly_avg.head(50))
+
+print('final output')
+print(df.head())
+
+print('final output with dls')
+print(df_price_with_dls.head())
+print(type(df_price_with_dls['EnergyCharge'].iloc[0]))
+
+print('final outbound') 
+print(df_outbound.tail())
